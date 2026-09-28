@@ -10,6 +10,19 @@ readme = "README.md"
 keywords = ["oauth", "jwt", "mcp", "adapter", "authplane"]
 categories = ["authentication", "api-bindings"]
 
+# Tests, examples and benches are not shipped in the published crate. They are
+# not what a consumer compiles against, they are all readable in the repository,
+# and `core/tests/fixtures/` holds RSA and EC private keys the unit tests and the
+# DPoP example use. Those keys are test material — nothing verifies against them —
+# but a crates.io version is immutable, so anything that ships stays shipped, and
+# key-shaped files in a published tarball are permanent noise for every downstream
+# secret scanner and SBOM. Keeping them out of the tarball costs nothing here.
+#
+# `examples/` goes with `tests/` rather than staying behind: the DPoP example
+# reads `tests/fixtures/test-private.pem` through `include_str!`, so shipping the
+# example without the fixture would leave it unbuildable from the tarball.
+exclude = ["tests/", "examples/", "benches/"]
+
 [dependencies]
 authplane-sdk = { path = "../core", version = "0.1.0" }
 axum = "0.8"
