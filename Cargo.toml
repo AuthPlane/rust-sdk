@@ -1,0 +1,39 @@
+[workspace]
+members = ["core", "mcp", "fastmcp", "conformance-tests"]
+resolver = "2"
+
+# Shared package metadata. Inherited per-crate via `.workspace = true`.
+#
+# `edition = "2024"` is load-bearing: the workspace uses `let`-chains
+# (`if let Some(x) = foo && cond(x)`) in many places, and they stabilised
+# in rustc 1.88, under edition 2024 only. Downgrading to edition 2021
+# would mean rewriting all of them as nested `if let` blocks, with no
+# user-visible MSRV benefit: 1.88 sits well below the floor the dependency
+# graph imposes. No inventory of the sites is kept here — the one that
+# used to be went stale, and rustc names every one of them if the edition
+# ever changes.
+#
+# `rust-version = "1.91"` is the floor consumers must meet. crates.io
+# surfaces this in package metadata; `cargo-msrv` and downstream tooling
+# enforce it. A bump here is a breaking change.
+#
+# 1.91 is measured, not assumed. This previously declared 1.85, which no
+# toolchain could honour — the value tracked edition 2024's requirement
+# and never the dependency graph. Measured against the current lockfile,
+# per publishable crate, with `--all-features`:
+#
+#   1.85  fails  unty-next needs 1.90; darling and time need 1.88; icu needs 1.86
+#   1.90  fails  asupersync uses Duration::from_mins, still unstable there
+#   1.91  builds
+#
+# Two other floors exist and are not the same thing: the `cargo` floor of
+# 1.90 documented in release.yml and publish-crates.yml is about the
+# tooling that packages the crates, and rust-toolchain.toml (1.98.0) pins
+# the compiler this repo builds with. This value is the only one that is a
+# promise to consumers, so it is the one that has to be true.
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.91"
+license = "Apache-2.0"
+repository = "https://github.com/AuthPlane/rust-sdk"

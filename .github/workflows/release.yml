@@ -1,0 +1,378 @@
+name: Release
+
+# Step 2 of the single-branch release: take the stabilized release/v* or
+# hotfix/v* branch, run tests, bump `[workspace.package] version` to
+# X.Y.Z, commit, tag vX.Y.Z, build + verify all three crates with cargo
+# package / cargo publish --dry-run, atomic-push branch + tag, create
+# the GitHub Release, and delete the source branch on success.
+#
+# Branch conventions:
+#   - release/v<X.Y.Z>: current-line release off the default branch.
+#   - hotfix/v<X.Y.Z>: patch for an older minor line. The workflow refuses
+#     dispatch unless (branch.major, branch.minor) is strictly older than
+#     the default branch's latest v<X.Y.Z> tag — use release/v* for
+#     current-line patches.
+#
+# crates.io publication is handled separately by `publish-crates.yml`,
+# triggered by the tag push. This keeps the OIDC identity tied to the
+# tag itself (Trusted Publisher OIDC claim = refs/tags/vX.Y.Z).
+#
+# The only release-time file edits are the `[workspace.package] version`
+# bump in the root Cargo.toml, the adapter->core dep version components,
+# and the Cargo.lock refresh. The adapter->core dependency keeps its
+# `{ path = "../core", version = "X.Y.Z" }` form: `cargo publish` strips the `path` key from the published manifest,
+# leaving the version requirement, so the published adapters resolve
+# authplane-sdk from crates.io while every pre-publish step (cargo update,
+# package, publish --dry-run) still resolves it from the local workspace.
+# Rewriting the dep to a bare `"X.Y.Z"` before the core crate exists on
+# crates.io breaks all of those steps ("no matching package named
+# `authplane-sdk` found") — do not reintroduce a pin step.
+#
+# Trigger: maintainer dispatches from the Actions UI with a release/v* or
+# hotfix/v* branch selected. Branch name is the source of truth for the
+# version that will become the tag.
+
+on:
+  workflow_dispatch:
+    inputs:
+      dryRun:
+        description: 'Dry run: bump versions, test, package, publish --dry-run locally; skip atomic push, crates.io uploads, GitHub Release, and branch deletion.'
+        required: false
+        type: boolean
+        default: false
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+# Set here rather than left to a toolchain action to set: incremental artifacts
+# are worthless on a fresh runner and only bloat the cache, and colour keeps
+# cargo's output readable in the log.
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Refuse if not dispatched from a release/v* or hotfix/v* branch
+        run: |
+          ref="${{ github.ref_name }}"
+          if [[ ! "$ref" =~ ^(release|hotfix)/v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::This workflow must be dispatched from a release/v<X.Y.Z> or hotfix/v<X.Y.Z> branch (got: $ref)"
+            exit 1
+          fi
+          echo "Dispatched from $ref"
+
+      - name: Check out repo with full history and all tags
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          fetch-depth: 0
+          ref: ${{ github.ref }}
+
+      # AuthPlane/conformance is a public sibling repo carrying the shared
+      # oauth-sdk-conformance-catalog.yaml. Without it, conformance-tests
+      # cannot assert catalog alignment. Being public, it needs no token: a
+      # plain unauthenticated fetch is enough, so no secret is plumbed here.
+      #
+      # Fetched at the revision pinned in `.conformance-catalog-ref` — the same
+      # script and the same pin ci.yml uses, so a release can never run against
+      # a different catalog than the PRs that led to it.
+      #
+      # The catalog lands in $RUNNER_TEMP, outside $GITHUB_WORKSPACE. It used to
+      # be checked out to `conformance/` inside the workspace, where it is not
+      # gitignored and carries its own `.git` — so the `git add -A` in the
+      # version-bump commit below would stage it as an embedded gitlink and
+      # carry that into the release commit and tag.
+      - name: Check out shared conformance catalog (out of tree)
+        shell: bash
+        run: .github/scripts/fetch-conformance-catalog.sh
+
+      # Cargo >= 1.90 floor: `cargo package --workspace` / `cargo publish
+      # --workspace` resolving the retained path+version deps against the
+      # locally packaged core (rather than requiring it on the registry
+      # first) landed in 1.90. The pin in rust-toolchain.toml satisfies this;
+      # never bump that channel below it.
+      - name: Install the Rust toolchain declared by rust-toolchain.toml
+        shell: bash
+        run: rustup toolchain install --profile minimal --no-self-update
+
+      - name: Cache cargo registry and target
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-release-${{ runner.os }}-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml') }}
+          restore-keys: |
+            cargo-release-${{ runner.os }}-
+
+      - name: Derive version from branch name
+        id: version
+        run: |
+          ref="${{ github.ref_name }}"
+          version="${ref##*/v}"
+          {
+            echo "version=$version"
+            echo "tag=v$version"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Refuse if tag already exists
+        run: |
+          if git ls-remote --exit-code --tags origin "${{ steps.version.outputs.tag }}" >/dev/null; then
+            echo "::error::Tag ${{ steps.version.outputs.tag }} already exists. Aborting."
+            exit 1
+          fi
+
+      # hotfix/v* is reserved for patches to an older minor line. Refuse
+      # dispatch if the branch's (major, minor) is not strictly less than
+      # the default branch's latest released (major, minor). Current-line
+      # patches should use release/v*, not hotfix/v*.
+      - name: Refuse if hotfix branch is not strictly an older-line patch
+        if: startsWith(github.ref_name, 'hotfix/')
+        run: |
+          default="${{ github.event.repository.default_branch }}"
+          git fetch origin "$default" --tags --no-recurse-submodules
+          if ! main_tag=$(git describe --tags --abbrev=0 "origin/$default" 2>/dev/null); then
+            echo "::error::Cannot determine $default's latest tag — has a release ever shipped? If not, use release/v* for the first release."
+            exit 1
+          fi
+          echo "$default's latest tag: $main_tag"
+
+          if ! [[ "$main_tag" =~ ^v([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
+            echo "::error::$default's latest tag '$main_tag' does not match vX.Y.Z."
+            exit 1
+          fi
+          main_major="${BASH_REMATCH[1]}"
+          main_minor="${BASH_REMATCH[2]}"
+
+          v="${{ steps.version.outputs.version }}"
+          [[ "$v" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]
+          br_major="${BASH_REMATCH[1]}"
+          br_minor="${BASH_REMATCH[2]}"
+
+          if (( br_major > main_major )) || { (( br_major == main_major )) && (( br_minor >= main_minor )); }; then
+            echo "::error::hotfix/v${v} is on line v${br_major}.${br_minor}, which is not strictly older than $default's line v${main_major}.${main_minor}."
+            echo "::error::Current-line patches must use release/v*, not hotfix/v*."
+            exit 1
+          fi
+          echo "Confirmed older-line patch: v${br_major}.${br_minor} < v${main_major}.${main_minor}"
+
+      - name: Verify CHANGELOG entry exists for this version
+        run: |
+          if ! grep -q "^## \[${{ steps.version.outputs.version }}\]" CHANGELOG.md 2>/dev/null; then
+            echo "::error::CHANGELOG.md has no entry for ## [${{ steps.version.outputs.version }}]"
+            exit 1
+          fi
+
+      - name: Configure git author
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      # Tests run with the workspace in its pre-release shape (adapters
+      # resolve the core via the `path` component of the path+version
+      # dep). The version bumps below keep that form — only the version
+      # components move — so resolution stays local for every subsequent
+      # step too.
+      - name: Run workspace tests
+        env:
+          CONFORMANCE_CATALOG_PATH: ${{ runner.temp }}/conformance/oauth-sdk-conformance-catalog.yaml
+        run: |
+          cargo test --workspace --all-features --locked
+
+      # All four workspace members inherit `version.workspace = true`, so
+      # the single source of truth is `[workspace.package] version` in the
+      # root Cargo.toml. Bumping it moves the three publishable crates in
+      # lockstep by construction; no skew is possible.
+      - name: Bump workspace version to X.Y.Z
+        run: |
+          v="${{ steps.version.outputs.version }}"
+          python3 - Cargo.toml "$v" <<'PY'
+          import re, sys
+          path, new_version = sys.argv[1], sys.argv[2]
+          with open(path, "r", encoding="utf-8") as fh:
+              text = fh.read()
+          # Only the `version = "..."` line inside [workspace.package] —
+          # the scan stops at the next `[section]` header line, so keys
+          # with array values (keywords, categories, ...) placed anywhere
+          # in the table do not break the match.
+          pattern = re.compile(
+              r'(^\[workspace\.package\][^\n]*\n(?:(?!\[)[^\n]*\n)*?version\s*=\s*")[^"]*(")',
+              re.MULTILINE,
+          )
+          new_text, n = pattern.subn(rf'\g<1>{new_version}\g<2>', text, count=1)
+          if n != 1:
+              sys.stderr.write(f"failed to bump [workspace.package] version in {path}\n")
+              sys.exit(1)
+          with open(path, "w", encoding="utf-8") as fh:
+              fh.write(new_text)
+          PY
+          if ! grep -q "^version = \"$v\"$" Cargo.toml; then
+            echo "::error::Failed to bump [workspace.package] version to $v."
+            exit 1
+          fi
+
+      # Keep the internal dep on the core crate in its
+      # `{ path = "../core", version = "X.Y.Z" }` form and bump only the
+      # `version` component. `cargo publish` strips the `path` key from the
+      # published manifest, leaving the version requirement, so the
+      # published adapters resolve authplane-sdk from crates.io — while
+      # every pre-publish step still resolves it from the local workspace
+      # member. conformance-tests is publish=false but its dep must stay in
+      # lockstep too or workspace resolution fails after the bump.
+      - name: Bump internal authplane-sdk dependency versions (path retained)
+        run: |
+          v="${{ steps.version.outputs.version }}"
+          for f in mcp/Cargo.toml fastmcp/Cargo.toml conformance-tests/Cargo.toml; do
+            python3 - "$f" "$v" <<'PY'
+          import re, sys
+          path, new_version = sys.argv[1], sys.argv[2]
+          with open(path, "r", encoding="utf-8") as fh:
+              text = fh.read()
+          # Rewrite the `version = "..."` component inside the
+          # `authplane-sdk = { ... }` inline table, leaving `path` intact.
+          pattern = re.compile(
+              r'^(authplane-sdk\s*=\s*\{[^}]*version\s*=\s*")[^"]*(")',
+              re.MULTILINE,
+          )
+          new_text, n = pattern.subn(rf'\g<1>{new_version}\g<2>', text, count=1)
+          if n != 1:
+              sys.stderr.write(f"failed to bump authplane-sdk dep version in {path}\n")
+              sys.exit(1)
+          with open(path, "w", encoding="utf-8") as fh:
+              fh.write(new_text)
+          PY
+            if ! grep -Eq "^authplane-sdk\s*=\s*\{[^}]*version\s*=\s*\"$v\"" "$f"; then
+              echo "::error::Failed to bump authplane-sdk dep version to \"$v\" in $f (path+version form expected)."
+              exit 1
+            fi
+          done
+
+      # Refresh the lockfile so `version = "X.Y.Z"` bumps take effect and
+      # the committed Cargo.lock matches what `cargo publish` will see.
+      - name: Update Cargo.lock to reflect new versions
+        run: |
+          cargo update --workspace --offline || cargo update --workspace
+
+      # If a maintainer pre-landed the version bumps on the release
+      # branch, git produces an identical tree and there is nothing to
+      # commit. Handle both cases: --allow-empty keeps the shape (always
+      # one release commit per version) and ensures the tag points at a
+      # distinct SHA.
+      - name: Commit version bumps on the release branch
+        run: |
+          git add -A
+          git commit --allow-empty -m "release: v${{ steps.version.outputs.version }}"
+
+      - name: Capture release commit SHA
+        id: sha
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Create annotated tag locally
+        run: |
+          git tag -a "${{ steps.version.outputs.tag }}" \
+            -m "Release ${{ steps.version.outputs.tag }}"
+
+      # Build .crate files for all three crates and verify they pack
+      # cleanly. Must run in --workspace mode: the adapters' path+version
+      # dep on authplane-sdk resolves against the locally-packaged core
+      # crate, whereas packaging each crate on its own verifies against
+      # the crates.io index and fails while the release version is not
+      # published yet ("no matching package named `authplane-sdk` found").
+      # `cargo publish --dry-run` additionally recompiles from the packed
+      # tarballs and performs the crates.io metadata checks the real
+      # publish will run.
+      - name: Package crates and validate with cargo publish --dry-run
+        run: |
+          cargo package --workspace --exclude authplane-conformance-tests --allow-dirty --locked
+          echo "=== target/package/ ==="
+          ls target/package/
+          cargo publish --workspace --exclude authplane-conformance-tests --dry-run --allow-dirty --locked
+
+      - name: Dry run short-circuit notice
+        if: ${{ inputs.dryRun }}
+        run: |
+          echo "::notice::Dry run — skipping atomic push, crates.io publish, GitHub Release, and branch deletion. Release commit SHA (would-be): ${{ steps.sha.outputs.sha }}"
+
+      - name: Atomic push of release branch and tag
+        if: ${{ !inputs.dryRun }}
+        run: |
+          git push --atomic origin "$GITHUB_REF_NAME" "${{ steps.version.outputs.tag }}"
+          echo "::notice::Released commit: ${{ steps.sha.outputs.sha }}"
+
+      - name: Extract CHANGELOG entry for release notes
+        if: ${{ !inputs.dryRun }}
+        run: |
+          version="${{ steps.version.outputs.version }}"
+          sha="${{ steps.sha.outputs.sha }}"
+          {
+            echo "_Released commit: \`$sha\`_"
+            echo ""
+            awk "/^## \[$version\]/{flag=1;next} /^## \[/{flag=0} flag" CHANGELOG.md
+          } > /tmp/release-notes.md
+          # If CHANGELOG extraction returned nothing beyond the SHA line, add a fallback.
+          if [[ $(wc -l < /tmp/release-notes.md) -le 2 ]]; then
+            echo "See CHANGELOG.md for details." >> /tmp/release-notes.md
+          fi
+
+      - name: Create GitHub Release
+        if: ${{ !inputs.dryRun }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "${{ steps.version.outputs.tag }}" \
+            --title "${{ steps.version.outputs.tag }}" \
+            --notes-file /tmp/release-notes.md
+
+      # Delete the source branch (release/v* or hotfix/v*) on success. The
+      # branch ruleset must allow the bot to delete. If this fails, warn
+      # loudly but do not fail the workflow — the release is already live.
+      - name: Delete source branch on remote
+        if: ${{ !inputs.dryRun }}
+        continue-on-error: true
+        id: delete
+        run: |
+          git push origin --delete "$GITHUB_REF_NAME"
+
+      - name: Warn if delete failed
+        if: ${{ !inputs.dryRun && steps.delete.outcome == 'failure' }}
+        run: |
+          echo "::warning::Source branch delete failed. Run manually: git push origin --delete $GITHUB_REF_NAME"
+
+      - name: Summary
+        if: always()
+        run: |
+          v="${{ steps.version.outputs.version }}"
+          sha="${{ steps.sha.outputs.sha }}"
+          if [[ "${{ inputs.dryRun }}" == "true" ]]; then
+            {
+              echo "### Dry run complete"
+              echo ""
+              echo "- **Version**: \`$v\` (not published)"
+              echo "- **Would-be released commit**: \`$sha\`"
+              echo "- Version bumps, tests, package, publish --dry-run — all succeeded."
+              echo "- Atomic push, GitHub Release, crates.io publish, and branch delete were skipped."
+            } >> "$GITHUB_STEP_SUMMARY"
+          else
+            {
+              echo "### Release tag pushed"
+              echo ""
+              echo "- **Version**: \`$v\`"
+              echo "- **Released commit**: \`$sha\`"
+              echo "- **Tag**: \`v$v\` (pushed — triggers \`publish-crates.yml\`)"
+              echo "- **GitHub Release**: ${{ github.server_url }}/${{ github.repository }}/releases/tag/v$v"
+              echo "- **crates.io (pending)**: [authplane-sdk](https://crates.io/crates/authplane-sdk/$v) · [authplane-mcp](https://crates.io/crates/authplane-mcp/$v) · [authplane-fastmcp](https://crates.io/crates/authplane-fastmcp/$v)"
+              if [[ "${{ steps.delete.outcome }}" != "success" ]]; then
+                echo ""
+                echo "⚠️ **Branch delete failed — run manually:** \`git push origin --delete $GITHUB_REF_NAME\`"
+              fi
+              echo ""
+              echo "**Follow-up:**"
+              echo "- If any commits on this branch should reach the default branch, dispatch **Backport fixes** with \`fromBranch=${{ steps.version.outputs.tag }}\` (the tag, not the branch — the branch is deleted)."
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi

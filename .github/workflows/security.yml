@@ -1,0 +1,77 @@
+name: Security Audit
+
+# Runs cargo-audit against the workspace Cargo.lock, checking the resolved
+# dependency tree for known RustSec advisories. Any finding fails the build;
+# accepted risks are pinned via an `ignore` entry in `.cargo-audit.toml`
+# with a comment.
+
+on:
+  pull_request:
+    paths:
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "core/Cargo.toml"
+      - "mcp/Cargo.toml"
+      - "fastmcp/Cargo.toml"
+      - ".github/workflows/security.yml"
+  push:
+    branches:
+      - main
+    paths:
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "core/Cargo.toml"
+      - "mcp/Cargo.toml"
+      - "fastmcp/Cargo.toml"
+      - ".github/workflows/security.yml"
+  schedule:
+    # Mondays 06:00 UTC — after dependabot runs.
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Set here rather than left to a toolchain action to set: incremental artifacts
+# are worthless on a fresh runner and only bloat the cache, and colour keeps
+# cargo's output readable in the log.
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  cargo-audit:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      # Installs what rust-toolchain.toml declares; see the note in ci.yml.
+      - name: Install the Rust toolchain declared by rust-toolchain.toml
+        shell: bash
+        run: rustup toolchain install --profile minimal --no-self-update
+
+      - name: Cache cargo bin
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            ~/.cargo/bin/cargo-audit
+            ~/.cargo/registry
+          key: cargo-audit-${{ runner.os }}-v0
+
+      - name: Install cargo-audit
+        run: |
+          if ! command -v cargo-audit >/dev/null; then
+            cargo install --locked cargo-audit
+          fi
+
+      - name: Ensure lockfile exists
+        run: cargo generate-lockfile
+
+      - name: Run cargo-audit
+        # Any vulnerability finding exits non-zero (default behavior).
+        # Accepted risks live in `.cargo/audit.toml` (the conventional
+        # cargo-audit policy file) with a rationale + upstream tracking
+        # link. cargo-audit auto-discovers that file from the working
+        # directory, so no explicit path is needed here.
+        run: cargo audit --deny warnings

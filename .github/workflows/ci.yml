@@ -1,0 +1,188 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+# Pull request runs share one group per PR (`github.ref` is
+# `refs/pull/<n>/merge`), so pushing again to the branch supersedes the run
+# already going — the older one is worthless once the head moves.
+#
+# Pushes to main are keyed by commit instead. Keying them by `github.ref` puts
+# every merge in one `refs/heads/main` group, where the runs either cancel each
+# other or queue one-deep, and in both shapes a merge commit can end up with no
+# CI result of its own. Per-commit groups let them run side by side.
+concurrency:
+  group: ci-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+# Set here rather than left to a toolchain action to set: incremental artifacts
+# are worthless on a fresh runner and only bloat the cache, and colour keeps
+# cargo's output readable in the log.
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  # Per-crate quality gates: matrixed over the publishable crates so a
+  # regression in one crate is isolated in the CI output and can be retried
+  # independently.
+  quality:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        crate:
+          - authplane-sdk
+          - authplane-mcp
+          - authplane-fastmcp
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      # No toolchain is named here on purpose. `rustup toolchain install`
+      # with no argument installs the one rust-toolchain.toml declares, with
+      # the components it lists, so the compiler version lives in exactly one
+      # tracked file. Passing an explicit `toolchain:` to a setup action would
+      # reintroduce a second place to change it, and a `stable` there floats:
+      # a Rust release could turn every open PR red with no code change, and a
+      # contributor could not reproduce it from a checkout.
+      - name: Install the Rust toolchain declared by rust-toolchain.toml
+        shell: bash
+        run: rustup toolchain install --profile minimal --no-self-update
+
+      - name: Cache cargo registry, git, and target
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: ${{ matrix.crate }}
+
+      - name: Format (${{ matrix.crate }})
+        run: cargo fmt -p ${{ matrix.crate }} -- --check
+
+      - name: Clippy (${{ matrix.crate }}, all targets, all features)
+        run: cargo clippy -p ${{ matrix.crate }} --all-targets --all-features -- -D warnings
+
+      - name: Test (${{ matrix.crate }})
+        run: cargo test -p ${{ matrix.crate }} --all-features
+
+      # `cargo package` and `cargo publish --dry-run` both resolve
+      # workspace dependencies through the registry. For `authplane-mcp`
+      # and `authplane-fastmcp`, which path-depend on `authplane-sdk` at
+      # the same `0.1.0` version, that lookup fails until `authplane-sdk`
+      # is on crates.io. Only run these steps for the leaf crate; the
+      # real release workflow (`release.yml`) publishes core first and
+      # then exercises the downstream crates against the freshly-pushed
+      # registry version.
+      - name: Package (${{ matrix.crate }})
+        if: matrix.crate == 'authplane-sdk'
+        run: cargo package -p ${{ matrix.crate }} --allow-dirty
+
+      - name: Publish dry-run (${{ matrix.crate }})
+        if: matrix.crate == 'authplane-sdk'
+        run: cargo publish --dry-run --allow-dirty -p ${{ matrix.crate }}
+
+  # Workspace-wide gate: covers crates that are not individually published
+  # (e.g. conformance-tests) and enforces cross-crate consistency of
+  # fmt/clippy/tests.
+  workspace:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      # conformance-tests is a workspace member, so `cargo test --workspace`
+      # below runs the catalog-alignment assertion. Without the catalog that
+      # assertion has nothing to compare against and skips, which is how this
+      # job passed while asserting nothing about catalog coverage — the gap
+      # only surfaced at release, the one workflow that did fetch it. Fetch it
+      # here too, at the pinned revision, so alignment is a PR-time gate.
+      #
+      # The read/guard/fetch sequence lives in the script because release.yml
+      # and the msrv job below need it identically. Source:
+      # github.com/AuthPlane/conformance (public).
+      - name: Check out shared conformance catalog (out of tree)
+        shell: bash
+        run: .github/scripts/fetch-conformance-catalog.sh
+
+      # Installs what rust-toolchain.toml declares; see the note in ci.yml.
+      - name: Install the Rust toolchain declared by rust-toolchain.toml
+        shell: bash
+        run: rustup toolchain install --profile minimal --no-self-update
+
+      - name: Cache cargo registry, git, and target
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: workspace
+
+      - name: Format (workspace)
+        run: cargo fmt --all -- --check
+
+      - name: Clippy (workspace, all targets, all features)
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+      - name: Test (workspace)
+        env:
+          CONFORMANCE_CATALOG_PATH: ${{ runner.temp }}/conformance/oauth-sdk-conformance-catalog.yaml
+        run: cargo test --workspace --all-features
+
+  msrv:
+    # Enforce the minimum supported Rust version declared in Cargo.toml
+    # (`rust-version = "1.91"`). A bump there is a breaking change, so
+    # failures require an explicit Cargo.toml update.
+    runs-on: ubuntu-latest
+    # This is what makes the gate real. rustup's override order puts
+    # rust-toolchain.toml above the default, so merely installing the MSRV
+    # toolchain left every step below building the pinned channel instead —
+    # the job passed while the declared MSRV (then 1.85) was uncompilable by
+    # any toolchain. `RUSTUP_TOOLCHAIN` is the one override that outranks the
+    # file. Keep this in step with `rust-version` in Cargo.toml; they are a
+    # pair, and the whole point of the job is that neither drifts alone.
+    env:
+      RUSTUP_TOOLCHAIN: "1.91"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      # This job also runs `cargo test --workspace`, so it also runs the
+      # alignment assertion. Fetch the catalog here too rather than leave one
+      # job silently skipping it: "the suite ran without a catalog" is the
+      # state this change exists to eliminate, and it should not survive in a
+      # corner of the matrix.
+      - name: Check out shared conformance catalog (out of tree)
+        shell: bash
+        run: .github/scripts/fetch-conformance-catalog.sh
+
+      # Installed by command, like every other job here — this was the last
+      # `dtolnay/rust-toolchain@master` in the workflow set, a mutable branch
+      # ref of a third-party action in a repo that SHA-pins `actions/checkout`.
+      #
+      # 1.91 is the measured floor of the current lockfile, not a guess. The
+      # earlier blocker recorded here — transitive dependencies flooring at
+      # 1.88 and 1.90 — is real but lands below 1.91, so a single
+      # workspace-level `rust-version` covers every crate and no per-crate
+      # split is needed. `asupersync` is the binding one: it uses
+      # `Duration::from_mins`, unstable until 1.91, and declares no
+      # `rust-version`, so Cargo cannot reject it up front — it fails at
+      # compile time instead, which is why this has to be a build and not a
+      # metadata check.
+      - name: Install the MSRV toolchain (1.91)
+        shell: bash
+        run: rustup toolchain install 1.91 --profile minimal --no-self-update
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: msrv
+
+      - name: Build workspace on MSRV
+        run: cargo build --workspace --all-features
+
+      - name: Test workspace on MSRV
+        env:
+          CONFORMANCE_CATALOG_PATH: ${{ runner.temp }}/conformance/oauth-sdk-conformance-catalog.yaml
+        run: cargo test --workspace --all-features

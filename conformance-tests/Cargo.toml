@@ -1,0 +1,29 @@
+[package]
+name = "authplane-conformance-tests"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Conformance test harness driving the AuthPlane OAuth SDK catalog against authplane-sdk."
+publish = false
+
+# Tests in this crate are language-neutral conformance cases derived from
+# the shared `oauth-sdk-conformance-catalog.yaml` living at
+# `<repo>/../conformance/oauth-sdk-conformance-catalog.yaml` (override with
+# the `CONFORMANCE_CATALOG_PATH` env var). Each test maps to a single
+# catalog case via the `conformance_case!` marker defined in `src/lib.rs`;
+# the `catalog_alignment` test refuses to compile if any catalog case is
+# missing a marker.
+
+[dependencies]
+authplane-sdk = { path = "../core", version = "0.1.0" }
+base64 = "0.22"
+jsonwebtoken = { version = "9", features = ["use_pem"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+
+[dev-dependencies]
+mockito = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

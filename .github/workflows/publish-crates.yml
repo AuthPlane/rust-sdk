@@ -1,0 +1,197 @@
+name: Publish to crates.io
+
+# Tag-triggered publish. The three crates go to crates.io from this
+# workflow; `release.yml` only pushes the tag and lets this workflow
+# take over.
+#
+# Runs on any `v*.*.*` tag regardless of which branch it points to
+# (release/v* for current-line releases, hotfix/v* for old-minor
+# patches). The tag itself is the authority — OIDC claim
+# `ref = refs/tags/vX.Y.Z` matches crates.io's Trusted Publisher
+# expectation and the GitHub environment's tag policy.
+#
+# Publish order is mandatory:
+#   1. authplane-sdk      (depended on by the adapters)
+#   2. authplane-mcp      (depends on authplane-sdk)
+#   3. authplane-fastmcp  (depends on authplane-sdk)
+#
+# After the core publish the job waits for the crate to appear on the
+# index before moving on — crates.io's sparse index is eventually
+# consistent, and the published adapter manifests carry a version
+# requirement on authplane-sdk (the `path` key is stripped at publish
+# time) that must already resolve from the registry.
+#
+# If any publish step fails partway through, the matching .crate
+# files are uploaded as a workflow artifact (`dist-v<X.Y.Z>/`) so
+# maintainers can finish the publish manually per RELEASE_SETUP.md
+# §5 using a short-lived API token.
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+concurrency:
+  group: publish-crates-${{ github.ref }}
+  cancel-in-progress: false
+
+# Set here rather than left to a toolchain action to set: incremental artifacts
+# are worthless on a fresh runner and only bloat the cache, and colour keeps
+# cargo's output readable in the log.
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    environment:
+      name: crates-io
+      url: https://crates.io/crates/authplane-sdk
+    permissions:
+      contents: read
+      id-token: write   # required for crates.io OIDC (trusted publishing)
+    steps:
+      - name: Check out the tagged commit
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          fetch-depth: 0
+          ref: ${{ github.ref }}
+
+      # Cargo >= 1.90 floor: `cargo package --workspace` / `cargo publish
+      # --workspace` resolving the retained path+version deps against the
+      # locally packaged core (rather than requiring it on the registry
+      # first) landed in 1.90. The pin in rust-toolchain.toml satisfies this;
+      # never bump that channel below it.
+      - name: Install the Rust toolchain declared by rust-toolchain.toml
+        shell: bash
+        run: rustup toolchain install --profile minimal --no-self-update
+
+      - name: Cache cargo registry and target
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-publish-${{ runner.os }}-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml') }}
+          restore-keys: |
+            cargo-publish-${{ runner.os }}-
+
+      - name: Derive version from tag
+        id: version
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          version="${tag#v}"
+          if ! [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Tag ${tag} is not a semantic v<X.Y.Z> version. Refusing to publish."
+            exit 1
+          fi
+          {
+            echo "tag=${tag}"
+            echo "version=${version}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Verify crate versions match tag
+        # The crates inherit `version.workspace = true`, so read the
+        # resolved versions from cargo metadata rather than scraping the
+        # per-crate manifests.
+        run: |
+          v="${{ steps.version.outputs.version }}"
+          meta=$(cargo metadata --no-deps --format-version 1)
+          for name in authplane-sdk authplane-mcp authplane-fastmcp; do
+            pkg_version=$(echo "$meta" | jq -r --arg n "$name" '.packages[] | select(.name == $n) | .version')
+            if [[ "$pkg_version" != "$v" ]]; then
+              echo "::error::$name resolves to version '$pkg_version' but tag is '$v'. Refusing to publish."
+              exit 1
+            fi
+          done
+          echo "All three crates declare version $v."
+
+      - name: Package crates
+        # Package the whole workspace in one invocation so the intra-workspace
+        # path+version deps (authplane-mcp / authplane-fastmcp -> authplane-sdk)
+        # resolve against the locally-packaged core crate. Packaging each crate
+        # on its own (`cargo package -p authplane-mcp`) verifies against the
+        # crates.io index instead and fails with "no matching package named
+        # `authplane-sdk` found" — the tagged core version is only published a
+        # few steps later. `--exclude` keeps the publish=false conformance
+        # crate out of target/package/ so the recovery artifact holds only the
+        # three publishable .crate files.
+        run: |
+          cargo package --workspace --exclude authplane-conformance-tests --locked
+          echo "=== target/package/ ==="
+          ls target/package/
+
+      - name: Verify packed crates contain the tagged version
+        run: |
+          v="${{ steps.version.outputs.version }}"
+          for name in authplane-sdk authplane-mcp authplane-fastmcp; do
+            if ! ls "target/package/${name}-${v}.crate" >/dev/null 2>&1; then
+              echo "::error::Missing target/package/${name}-${v}.crate — cargo package did not produce the expected artifact."
+              ls target/package/ || true
+              exit 1
+            fi
+          done
+
+      - name: Upload packed crates (for manual recovery if publish fails)
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: dist-v${{ steps.version.outputs.version }}
+          path: target/package/*.crate
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Exchange OIDC for a crates.io publish token
+        uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
+        id: crates-auth
+
+      - name: Publish authplane-sdk to crates.io
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.crates-auth.outputs.token }}
+        run: |
+          cargo publish -p authplane-sdk --locked --no-verify
+
+      - name: Wait for authplane-sdk to appear on the index
+        env:
+          CRATE_NAME: authplane-sdk
+          CRATE_VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -e
+          prefix="${CRATE_NAME:0:2}/${CRATE_NAME:2:2}"
+          url="https://index.crates.io/${prefix}/${CRATE_NAME}"
+          for attempt in $(seq 1 18); do
+            echo "attempt $attempt: GET $url"
+            if curl -fsSL "$url" | grep -q "\"vers\":\"${CRATE_VERSION}\""; then
+              echo "$CRATE_NAME $CRATE_VERSION is visible on the index."
+              exit 0
+            fi
+            sleep 10
+          done
+          echo "::error::$CRATE_NAME $CRATE_VERSION did not appear on the index within the poll window."
+          exit 1
+
+      - name: Publish authplane-mcp to crates.io
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.crates-auth.outputs.token }}
+        run: |
+          cargo publish -p authplane-mcp --locked --no-verify
+
+      - name: Publish authplane-fastmcp to crates.io
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.crates-auth.outputs.token }}
+        run: |
+          cargo publish -p authplane-fastmcp --locked --no-verify
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "### crates.io publish"
+            echo ""
+            echo "- **Tag**: \`${{ steps.version.outputs.tag }}\`"
+            echo "- **Version**: \`${{ steps.version.outputs.version }}\`"
+            echo "- [authplane-sdk](https://crates.io/crates/authplane-sdk/${{ steps.version.outputs.version }}) · [authplane-mcp](https://crates.io/crates/authplane-mcp/${{ steps.version.outputs.version }}) · [authplane-fastmcp](https://crates.io/crates/authplane-fastmcp/${{ steps.version.outputs.version }})"
+            echo ""
+            echo "If this workflow failed mid-publish, the \`dist-v${{ steps.version.outputs.version }}\` artifact contains the packed \`.crate\` files needed for manual recovery. See \`RELEASE_SETUP.md\` §5."
+          } >> "$GITHUB_STEP_SUMMARY"

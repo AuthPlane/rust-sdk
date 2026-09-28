@@ -1,0 +1,91 @@
+name: Workflow tooling
+
+# Catches workflow YAML / shell-in-`run:` regressions at PR time so a typo
+# cannot reach a release tag and surface only when a publish run fails. The
+# shell scripts under `scripts/` and `.github/scripts/` are in the same
+# category — a break in them surfaces only when someone reaches for them, after
+# a release or on a weekly schedule, which is the worst moment to discover it.
+#
+# Scoped to `.github/workflows/**`, `.github/scripts/*.sh` and `scripts/*.sh`
+# so unrelated PRs pay nothing for it.
+#
+# Linting alone is not enough for the conformance drift scripts, so they carry
+# their own controls here as well. Shellcheck cannot see the way they break: a
+# loosened id regex that drops cases, or a `diff` whose exit code stops being
+# read, is valid shell. The result would be a check that reports green while
+# guarding nothing, on a weekly schedule where nobody is watching, and it would
+# stay unnoticed until a real re-tightening slipped through — the failure that
+# check exists to prevent. The controls need neither a toolchain nor the
+# catalog clone, so they run in this job.
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/**"
+      - ".github/scripts/*.sh"
+      - "scripts/*.sh"
+  push:
+    branches:
+      - develop
+    paths:
+      - ".github/workflows/**"
+      - ".github/scripts/*.sh"
+      - "scripts/*.sh"
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      # Pulls the matching actionlint binary release from GitHub Releases via
+      # the upstream download script. The script is fetched by commit SHA (not
+      # a mutable tag) and sha256-verified before it runs, so nothing here
+      # downloads-then-runs an unpinned artifact. The script then
+      # checksum-verifies the actionlint binary it pulls from the matching
+      # release.
+      #
+      # To bump: change ACTIONLINT_VERSION, set ACTIONLINT_SCRIPT_SHA to the
+      # commit the new tag points at (`gh api repos/rhysd/actionlint/commits/vX.Y.Z -q .sha`),
+      # and update ACTIONLINT_SCRIPT_SHA256 to that file's sha256.
+      #
+      # The install dir is passed explicitly as the script's second positional
+      # argument so this workflow does not couple to the script's internal
+      # default of $PWD, which happens to be $GITHUB_WORKSPACE after checkout —
+      # a coincidence, not a contract.
+      - name: Install actionlint
+        shell: bash
+        env:
+          ACTIONLINT_VERSION: "1.7.7"
+          ACTIONLINT_SCRIPT_SHA: "03d0035246f3e81f36aed592ffb4bebf33a03106"
+          ACTIONLINT_SCRIPT_SHA256: "221d1d16c03e4e4fcd867de34104e8d479bdce20ccdfa553b9a5c0dc29bf6af2"
+          ACTIONLINT_INSTALL_DIR: ${{ runner.temp }}/actionlint
+        run: |
+          mkdir -p "${ACTIONLINT_INSTALL_DIR}"
+          script="${ACTIONLINT_INSTALL_DIR}/download-actionlint.bash"
+          curl -fsSL -o "${script}" \
+            "https://raw.githubusercontent.com/rhysd/actionlint/${ACTIONLINT_SCRIPT_SHA}/scripts/download-actionlint.bash"
+          echo "${ACTIONLINT_SCRIPT_SHA256}  ${script}" | sha256sum -c -
+          bash "${script}" "${ACTIONLINT_VERSION}" "${ACTIONLINT_INSTALL_DIR}"
+          echo "${ACTIONLINT_INSTALL_DIR}" >> "${GITHUB_PATH}"
+          "${ACTIONLINT_INSTALL_DIR}/actionlint" -version
+
+      # `-shellcheck=shellcheck` makes the shellcheck dependency explicit rather
+      # than relying on actionlint's implicit lookup against the runner image's
+      # $PATH; if the Ubuntu image ever drops shellcheck the job fails loudly
+      # instead of silently degrading to YAML-only linting.
+      - name: Run actionlint
+        run: actionlint -color -shellcheck=shellcheck
+
+      - name: Shellcheck the workflow support scripts
+        run: shellcheck .github/scripts/*.sh
+
+      - name: Shellcheck the developer scripts
+        run: shellcheck scripts/*.sh
+
+      - name: Test the conformance drift scripts
+        run: .github/scripts/conformance-case-body-drift.test.sh

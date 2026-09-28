@@ -1,0 +1,32 @@
+[package]
+name = "authplane-sdk"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Authplane Rust SDK core primitives."
+readme = "README.md"
+keywords = ["oauth", "jwt", "security", "mcp", "authplane"]
+categories = ["authentication", "api-bindings"]
+
+[dependencies]
+async-trait = "0.1"
+base64 = "0.22"
+chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
+jsonwebtoken = { version = "9", features = ["use_pem"] }
+p256 = { version = "0.13", features = ["pem"] }
+percent-encoding = "2"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+rsa = { version = "0.9", features = ["pem"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+thiserror = "2"
+tokio = { version = "1", features = ["macros", "net", "rt", "rt-multi-thread", "sync", "time"] }
+url = "2"
+uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+mockito = "1"
+serde_yaml = "0.9"

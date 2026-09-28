@@ -1,0 +1,93 @@
+# Authplane Rust SDK — LLM Guide
+
+Short guide. For complete context and detailed examples, read `llm-full.txt`.
+
+## What this repo provides
+
+A Cargo workspace containing the framework-agnostic Authplane SDK and an
+MCP adapter for protecting MCP servers and OAuth 2.1 resource servers
+with tokens issued by an Authplane authorization server.
+
+Crates (published independently on crates.io):
+
+- `core/` — crate `authplane-sdk` — full OAuth 2.1 client, token
+  verification, DPoP, SSRF-hardened transport, circuit breaker, and
+  caching.
+- `mcp/` — crate `authplane-mcp` — thin adapter for the
+  [rmcp](https://crates.io/crates/rmcp) MCP framework with URL-elicitation
+  helpers.
+- `fastmcp/` — crate `authplane-fastmcp` — thin adapter for
+  [fastmcp-rust](https://crates.io/crates/fastmcp-rust) with URL-elicitation
+  helpers; supports both stdio and HTTP transports.
+
+## First files to read
+
+- `README.md` (root) — overview and layout
+- `Cargo.toml` (root) — workspace members
+- `rust-toolchain.toml` — pinned Rust toolchain
+- `core/src/lib.rs` — public API re-exports
+- `core/src/errors.rs` — error types
+- `core/src/fetch_settings.rs` — FetchSettings (SSRF policy)
+- `core/src/transport.rs` — DNS-resolving SSRF protection, HTTP client builder
+- `core/src/metadata.rs` — AS metadata discovery (RFC 8414)
+- `core/src/oauth.rs` — OAuth operations (client_credentials, token_exchange,
+  introspection, revocation)
+- `core/src/resource.rs` — AuthplaneResource (JWT verification, DPoP inbound)
+- `core/src/client.rs` — AuthplaneClient (AS connection, JWKS management)
+- `core/src/client_builder.rs` — AuthplaneClientBuilder
+- `core/src/auth.rs` — AuthplaneAuth (token management)
+- `core/src/auth_provider.rs` — AuthProvider trait
+- `core/src/dpop.rs` — DPoP proof create/verify, SUPPORTED_DPOP_ALGORITHMS
+- `core/src/dpop_provider.rs` — DpopProvider (nonce store, proof generation)
+- `core/src/dpop_replay.rs` — DpopReplayStore trait + InMemoryDpopReplayStore
+- `core/src/verified_claims.rs` — VerifiedClaims type
+- `core/src/prm.rs` — Protected Resource Metadata (RFC 9728)
+- `core/src/www_authenticate.rs` — WWW-Authenticate header builder
+- `core/src/circuit_breaker.rs` — CircuitBreaker state machine
+- `core/src/circuit_policy.rs` — CircuitPolicy (failure classification)
+- `core/src/cache/` — mod.rs, jwks_cache.rs, document_cache.rs,
+  token_cache.rs, cache_headers.rs
+- `conformance-tests/` — shared OAuth SDK conformance test suite
+- `mcp/src/lib.rs`, `mcp/examples/`
+- `fastmcp/src/lib.rs`, `fastmcp/examples/`
+## Architecture rules
+
+- Typed error definitions and OAuth mapping live in `core/` (crate
+  `authplane-sdk`).
+- Adapters (`mcp/`, `fastmcp/`) must stay thin: detect consent /
+  interaction-required SDK errors and raise framework-specific errors
+  (e.g. MCP URL-elicitation error `-32042` when `consent_url` is present).
+- Do not duplicate error types or OAuth mapping in the adapters.
+- Preserve typed metadata for consent flows (`service_id`, `cause_detail`,
+  `consent_url`).
+- Adapter wrappers stay minimal and stateless.
+
+## Minimal usage example
+
+```rust
+use authplane_sdk::{parse_token_exchange_error, AuthplaneError};
+
+let err = parse_token_exchange_error(Some(400), body);
+if let AuthplaneError::ConsentRequired(consent) = err {
+    // prompt the user, or (in an adapter) raise a URL-elicitation error
+}
+```
+
+## Validation commands
+
+- `cargo build`
+- `cargo test`
+- `cargo fmt --check`
+- `cargo clippy --all-targets --all-features -- -D warnings`
+
+## Cross-repo references
+
+- Authplane authorization server: `https://github.com/AuthPlane/authserver`
+- Conformance catalog: `https://github.com/AuthPlane/conformance`
+
+## Editing guidance for AI agents
+
+- Respect crate boundaries — `mcp/` depends on `authplane-sdk`
+  through the workspace's path dep.
+- Keep adapter code free of OAuth mapping logic.
+- Add focused tests when behavior changes.

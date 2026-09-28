@@ -1,0 +1,201 @@
+# Authplane Rust SDK — Complete LLM Reference
+
+> Cargo workspace for protecting MCP servers and OAuth 2.1 resource servers
+> with tokens issued by an Authplane authorization server. Contains the
+> framework-agnostic SDK (`core/`) and an MCP adapter (`mcp/`) as
+> independently publishable crates.
+
+## When To Use This Repository
+
+Use this repo when you need to:
+- modify typed OAuth / Authplane error models or their mapping from OAuth
+  token endpoint payloads
+- evolve circuit-policy decisions for OAuth errors
+- wire the typed errors into the [rmcp](https://crates.io/crates/rmcp) Rust
+  MCP framework (`mcp/`) or [fastmcp-rust](https://crates.io/crates/fastmcp-rust) (`fastmcp/`)
+- tune URL-elicitation (`-32042`) behavior in the adapter
+
+## Repository Structure
+
+| Path | Purpose |
+|---|---|
+| `Cargo.toml` (root) | workspace manifest |
+| `rust-toolchain.toml` | pinned toolchain |
+| `core/` | crate `authplane-sdk` — full OAuth 2.1 client, verification, DPoP, transport, caching |
+| `core/src/lib.rs` | public API re-exports |
+| `core/src/errors.rs` | `AuthError`, `ConsentRequiredError`, `AuthplaneError`, `map_oauth_error` |
+| `core/src/fetch_settings.rs` | `FetchSettings` (SSRF policy: HTTPS-only, allowed hosts, dev mode) |
+| `core/src/transport.rs` | DNS-resolving SSRF protection, HTTP client builder |
+| `core/src/metadata.rs` | AS metadata discovery (RFC 8414) |
+| `core/src/oauth.rs` | OAuth operations: `client_credentials`, `token_exchange`, introspection, revocation |
+| `core/src/resource.rs` | `AuthplaneResource` (JWT verification, inbound DPoP binding) |
+| `core/src/client.rs` | `AuthplaneClient` (AS connection, JWKS management, background refresh) |
+| `core/src/client_builder.rs` | `AuthplaneClientBuilder` (runtime knobs for caches, circuit breaker, DPoP) |
+| `core/src/auth.rs` | `AuthplaneAuth` (token management) |
+| `core/src/auth_provider.rs` | `AuthProvider` trait (stored credentials) |
+| `core/src/dpop.rs` | DPoP proof create/verify, `SUPPORTED_DPOP_ALGORITHMS` |
+| `core/src/dpop_provider.rs` | `DpopProvider` (per-origin nonce store, proof generation) |
+| `core/src/dpop_replay.rs` | `DpopReplayStore` trait + `InMemoryDpopReplayStore` |
+| `core/src/verified_claims.rs` | `VerifiedClaims` type |
+| `core/src/prm.rs` | Protected Resource Metadata (RFC 9728) |
+| `core/src/www_authenticate.rs` | `WWW-Authenticate` header builder |
+| `core/src/circuit_breaker.rs` | `CircuitBreaker` state machine (closed/open/half-open) |
+| `core/src/circuit_policy.rs` | `CircuitPolicy` (failure classification for OAuth errors) |
+| `core/src/cache/mod.rs` | cache module root |
+| `core/src/cache/jwks_cache.rs` | JWKS cache with background refresh and `kid`-miss force-refresh |
+| `core/src/cache/document_cache.rs` | generic document cache |
+| `core/src/cache/token_cache.rs` | token cache with TTL buffer for `client_credentials` |
+| `core/src/cache/cache_headers.rs` | `Cache-Control` / `Expires` header parsing |
+| `conformance-tests/` | shared OAuth SDK conformance test suite |
+| `mcp/` | crate `authplane-mcp` — rmcp adapter |
+| `mcp/examples/` | rmcp URL-elicitation examples |
+| `fastmcp/` | crate `authplane-fastmcp` — fastmcp-rust adapter (stdio + HTTP) |
+| `fastmcp/examples/` | fastmcp URL-elicitation and calculator demo examples |
+
+## Layering Rules (Important)
+
+1. Typed errors, OAuth mapping, and circuit policy live only in `core/`.
+2. The adapters (`mcp/`, `fastmcp/`) must stay thin: detect consent /
+   interaction-required SDK errors and raise framework-specific errors.
+3. Do not duplicate error types or OAuth mapping in the adapter.
+4. Preserve typed metadata for consent flows (`service_id`, `cause_detail`,
+   `consent_url`).
+5. Adapter wrappers stay minimal and stateless.
+6. Each crate is published independently on crates.io; the adapter depends
+   on `authplane-sdk` through the workspace's `path = "../core"` dep.
+
+## Error Model (`core/`)
+
+- `AuthError` — generic OAuth / API failure shape.
+- `ConsentRequiredError` — typed variant for `consent_required` and
+  `interaction_required`.
+- `AuthplaneError` — SDK-level error enum exposing both.
+
+### OAuth Mapping Behavior
+
+`map_oauth_error(status_code, payload)` maps:
+
+- `consent_required` and `interaction_required` → `ConsentRequiredError`
+- any other OAuth error → `AuthError`
+
+When building a `ConsentRequiredError`:
+
+- `service_id` is derived from `service_id`, then `service`, then
+  `resource`, with fallback `unknown_service`.
+- `cause_detail` comes from `cause` if present, else `error_description`.
+- `consent_url` is read from `consent_url` when available.
+
+### Circuit Policy
+
+`should_open_circuit_for_oauth_error(code)` must *not* open the circuit for
+expected client-class OAuth failures, including:
+
+- `invalid_grant`, `invalid_client`, `unauthorized_client`
+- `invalid_scope`, `invalid_target`
+- `consent_required`, `interaction_required`
+
+## URL Elicitation Mapping (adapter)
+
+The adapter raises URL-elicitation errors when all of the following are true:
+
+1. SDK error is `AuthplaneError::ConsentRequired(_)`.
+2. OAuth code is `consent_required` or `interaction_required`.
+3. `consent_url` is present on the `ConsentRequiredError`.
+
+The elicitation payload includes `mode: "url"`, the `url`, an
+`elicitationId`, and a contextual message derived from the service and cause
+details.
+
+### `mcp/` — `authplane-mcp`
+
+- Targets `rmcp`.
+- Emits `rmcp::model::ErrorData` with
+  `ErrorCode::URL_ELICITATION_REQUIRED` (`-32042`).
+
+The adapter exposes a small, stateless API:
+
+- `to_url_elicitation_required_error(error)`
+- `wrap_tool_with_url_elicitation(handler)`
+
+### `fastmcp/` — `authplane-fastmcp`
+
+- Targets `fastmcp-rust` (0.3+, which supports both stdio and HTTP).
+- Emits `fastmcp_rust::McpError` with `McpErrorCode::Custom(-32042)`.
+
+Same stateless API shape:
+
+- `to_url_elicitation_required_error(error)`
+- `wrap_tool_with_url_elicitation(handler)`
+
+## Examples
+
+### 1) Parse a token-exchange error (`core`)
+
+```rust
+use authplane_sdk::{AuthplaneError, parse_token_exchange_error};
+
+let body = r#"{
+  "error":"consent_required",
+  "error_description":"Consent needed",
+  "service_id":"drive",
+  "consent_url":"https://example.com/consent"
+}"#;
+
+match parse_token_exchange_error(Some(400), body) {
+    AuthplaneError::ConsentRequired(consent) => {
+        assert_eq!(consent.service_id, "drive");
+    }
+    AuthplaneError::Auth(_) => unreachable!("expected consent-required mapping"),
+}
+```
+
+### 2) Circuit policy (`core`)
+
+```rust
+use authplane_sdk::should_open_circuit_for_oauth_error;
+
+assert!(!should_open_circuit_for_oauth_error("consent_required"));
+assert!(should_open_circuit_for_oauth_error("server_error"));
+```
+
+### 3) rmcp mapping (`mcp/`)
+
+```rust
+use authplane_sdk::AuthplaneError;
+use authplane_mcp::to_url_elicitation_required_error;
+
+fn map(error: AuthplaneError) {
+    if let Err(mcp_error) = to_url_elicitation_required_error(error) {
+        eprintln!("mapped MCP error code: {}", mcp_error.code.0);
+    }
+}
+```
+
+## Validation
+
+```bash
+cargo build
+cargo test
+cargo fmt --check
+cargo clippy --all-targets --all-features -- -D warnings
+```
+
+## Typical AI-Agent Tasks
+
+- extend OAuth mapping to new error codes with backwards-compatible types
+- adjust circuit-policy decisions based on new server error codes
+- tune URL-elicitation payloads in `mcp/`
+
+## Guardrails
+
+- keep comments concise and direct
+- do not introduce adapter concerns into `core/`
+- add tests for every behavioral change in mapping, circuit policy, or
+  adapter error translation
+- preserve crate API surface unless explicitly changing it
+
+## References
+
+- Authplane authorization server: https://github.com/AuthPlane/authserver
+- Conformance catalog: https://github.com/AuthPlane/conformance
+- License: Apache-2.0 (`LICENSE`)

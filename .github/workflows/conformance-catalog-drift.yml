@@ -1,0 +1,265 @@
+name: Conformance catalog drift
+
+# Early warning for conformance-catalog drift.
+#
+# ci.yml and release.yml pin the catalog to the SHA in
+# `.conformance-catalog-ref`, so a case added upstream can never break CI here
+# on its own. The trade-off is that new cases stay invisible until someone
+# bumps the pin. This job closes that gap: weekly, it clones the catalog's
+# *default* branch (latest, unpinned), points the harness at it, and runs the
+# same `catalog_alignment` assertion PR CI runs against the pinned catalog. The
+# only difference is which catalog it reads.
+#
+# This workflow has no `pull_request` trigger, so a failing scheduled run can
+# never block a PR. It deliberately FAILS on drift, so the run turns red and
+# the `::warning::` plus job-summary note are not buried in an otherwise-green
+# run — prompting a coordinated ref bump alongside the SDK-side coverage.
+#
+# The job runs TWO checks, because they see different things:
+#
+#   1. Case-ID alignment against the tip. Reports cases ADDED to the catalog
+#      that this suite does not yet cover, and markers with no catalog case.
+#      This is a set comparison over ids.
+#
+#   2. Case-BODY drift for the cases this suite registers. Reports a case that
+#      was re-tightened IN PLACE — same id, changed requirement. Check 1 is
+#      blind to this by construction: the id set is unchanged, so the case still
+#      looks adopted while the requirement underneath it has moved, and the
+#      suite keeps declaring conformance to wording nothing verified it against.
+#      That has already happened once, to the metadata jwks_uri rotation case.
+#      Check 2 needs the catalog at BOTH refs in the same job, which is why the
+#      pinned catalog is fetched here alongside the tip.
+
+on:
+  schedule:
+    # Mondays 07:00 UTC.
+    - cron: "0 7 * * 1"
+  workflow_dispatch:
+
+# Least-privilege default; this workflow only reads the repo.
+permissions:
+  contents: read
+
+# Set here rather than left to a toolchain action to set: incremental artifacts
+# are worthless on a fresh runner and only bloat the cache, and colour keeps
+# cargo's output readable in the log.
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  drift:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      # Deliberately unpinned, unlike ci.yml and release.yml which go through
+      # .github/scripts/fetch-conformance-catalog.sh to get the SHA in
+      # `.conformance-catalog-ref`. Reading the tip is what lets this job see
+      # cases added since the pin. Cloned into $RUNNER_TEMP — outside
+      # $GITHUB_WORKSPACE — so the catalog stays out of the working tree and
+      # cargo never treats it as a workspace member.
+      - name: Clone latest shared conformance catalog (default branch)
+        shell: bash
+        run: |
+          git clone --depth=1 https://github.com/AuthPlane/conformance.git \
+            "$RUNNER_TEMP/conformance" \
+            || { echo "::error::Could not clone the conformance catalog default branch"; exit 1; }
+
+      # The alignment test reports a missing catalog as a harness problem, which
+      # the report step below would otherwise have to disentangle from real
+      # drift. Catch it here, where the cause is unambiguous, so nobody goes
+      # hunting for uncovered cases that do not exist.
+      - name: Verify the catalog was fetched
+        shell: bash
+        run: |
+          catalog="$RUNNER_TEMP/conformance/oauth-sdk-conformance-catalog.yaml"
+          if [[ ! -f "$catalog" ]]; then
+            echo "::error::The conformance catalog is not at $catalog — the clone step did not produce it. This is a harness problem, not catalog drift."
+            exit 1
+          fi
+
+      # Installs what rust-toolchain.toml declares; see the note in ci.yml.
+      - name: Install the Rust toolchain declared by rust-toolchain.toml
+        shell: bash
+        run: rustup toolchain install --profile minimal --no-self-update
+
+      - name: Cache cargo registry, git, and target
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: conformance-drift
+
+      # Only the alignment target, not the whole suite. The assertion compares
+      # catalog ids against `conformance_case!` markers found by scanning the
+      # test sources textually, so it does not need the other conformance tests
+      # to execute.
+      #
+      # `--test catalog_alignment` names a test *target*, not a filter. If the
+      # target is ever renamed, cargo exits non-zero ("no test target named
+      # ...") rather than matching nothing and reporting success — so this job
+      # cannot go silently green by losing track of the test it exists to run.
+      #
+      # Allowed to fail the job — no `continue-on-error` — so drift turns the
+      # scheduled run red.
+      #
+      # Output is redirected to a file rather than piped, so the step's exit
+      # status is cargo's own and never a downstream filter's; the log is echoed
+      # afterwards and re-read by the report step.
+      - name: Run catalog-alignment check against latest catalog
+        id: align
+        shell: bash
+        env:
+          CONFORMANCE_CATALOG_PATH: ${{ runner.temp }}/conformance/oauth-sdk-conformance-catalog.yaml
+        run: |
+          log="$RUNNER_TEMP/alignment.log"
+          status=0
+          cargo test -p authplane-conformance-tests --test catalog_alignment \
+            >"$log" 2>&1 || status=$?
+          cat "$log"
+          exit "$status"
+
+      # The catalog at the ref this repo PINS, alongside the tip cloned above.
+      # The body check needs both to compare anything; with only the tip it
+      # would have nothing to compare against and could report nothing but
+      # green. Reuses the same fetch ci.yml and release.yml use — including its
+      # 40-hex-SHA guard, its unreachable-ref failure and its catalog-file
+      # check — rather than a second copy of that logic that could be tightened
+      # in one place and not the other. CONFORMANCE_CATALOG_DEST keeps it off
+      # the default path, which the tip clone above already occupies.
+      #
+      # Placed AFTER the alignment check, with `if: always()`, so the two checks
+      # fail independently. Only check 2 reads the pinned catalog. Run before
+      # `align`, a failed fetch — a transient error on this second clone, or a
+      # pinned SHA that has become unreachable — would skip the toolchain
+      # install and `align` (neither carries an `if:`, so both default to
+      # `success()`) and silently drop the id-level check that ran on its own
+      # before check 2 existed. `Report drift` would then find no alignment.log
+      # and report the skip as a harness problem, which is the wrong diagnosis
+      # for a check that never started.
+      - name: Fetch pinned conformance catalog (out of tree)
+        if: always()
+        shell: bash
+        env:
+          CONFORMANCE_CATALOG_DEST: ${{ runner.temp }}/conformance-pinned
+        run: .github/scripts/fetch-conformance-catalog.sh
+
+      # The ids for check 2. Registration here is the `conformance_case!` marker
+      # in the test sources, and the binary below recovers the ids by running
+      # `load_source_case_ids()` — the same function the alignment assertion
+      # uses. Sharing it is the point: a second extractor written for this check
+      # could disagree with the first, and an id it failed to see would be a
+      # case the body check silently stopped guarding.
+      #
+      # It reads only this repo's sources, so it needs neither catalog. That is
+      # what the id list means here: the cases this commit's markers claim, not
+      # what some run of the suite happened to reach.
+      #
+      # `if: always()` because the step above is EXPECTED to go red whenever the
+      # tip has drifted, and the body check must still run after it.
+      - name: Collect the case ids this suite registers
+        if: always()
+        shell: bash
+        run: |
+          report="$RUNNER_TEMP/conformance-case-ids.json"
+          cargo run -q -p authplane-conformance-tests --bin conformance-case-ids > "$report"
+
+          CONFORMANCE_CASE_IDS="$report" \
+            .github/scripts/conformance-registered-case-ids.sh \
+            > "$RUNNER_TEMP/registered-case-ids.txt"
+          echo "This suite registers $(wc -l < "$RUNNER_TEMP/registered-case-ids.txt") conformance case(s)."
+
+      # Check 2. Fails the job when a case this suite registers changed body
+      # between the pinned ref and the tip, and fails just as loudly when it
+      # cannot do that comparison at all.
+      - name: Check pinned case bodies against the catalog tip
+        id: bodies
+        if: always()
+        shell: bash
+        env:
+          PINNED_CATALOG: ${{ runner.temp }}/conformance-pinned/oauth-sdk-conformance-catalog.yaml
+          TIP_CATALOG: ${{ runner.temp }}/conformance/oauth-sdk-conformance-catalog.yaml
+          REGISTERED_IDS: ${{ runner.temp }}/registered-case-ids.txt
+          COVERAGE_DIR: conformance-tests/tests/
+        run: |
+          DRIFT_SUMMARY="$GITHUB_STEP_SUMMARY" \
+            .github/scripts/conformance-case-body-drift.sh
+
+      # Runs even when the alignment step fails the job, so the `::warning::`
+      # and the job summary are always written on drift. A `failure` outcome
+      # alone does not mean drift — the step also fails on a compile error or a
+      # registry outage. Real drift is identified by the two assertion messages
+      # in catalog_alignment.rs that only fire on a catalog/marker mismatch;
+      # anything else is reported as an infrastructure problem, as are
+      # skipped/cancelled outcomes where an earlier step failed and the
+      # alignment never ran.
+      - name: Report drift
+        if: always()
+        shell: bash
+        run: |
+          pinned="$(tr -d '[:space:]' < "$GITHUB_WORKSPACE/.conformance-catalog-ref")"
+          grep -Eq '^[0-9a-f]{40}$' <<<"$pinned" \
+            || { echo "::error::.conformance-catalog-ref must be a 40-hex commit SHA"; exit 1; }
+
+          # The body check writes its own detail into the step summary when it
+          # finds something. Recorded here either way, so a green run states
+          # that both checks ran rather than only the one that prints on
+          # success — a check whose silence is indistinguishable from its
+          # absence is how this class went unnoticed in the first place.
+          if [ "${{ steps.bodies.outcome }}" = "success" ]; then
+            echo "### Conformance case bodies: no registered case changed shape under an unchanged id." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "::warning::The pinned case-body check did not pass (outcome: ${{ steps.bodies.outcome }}). Either a case this suite registers was re-tightened under the same id, or the check could not run. Read its step log — it names the case."
+          fi
+
+          case "${{ steps.align.outcome }}" in
+            success)
+              {
+                echo "### Conformance catalog: in sync"
+                echo ""
+                echo "The suite is aligned with the latest catalog (default branch)."
+                echo "Pinned ref: \`$pinned\`"
+              } >> "$GITHUB_STEP_SUMMARY"
+              ;;
+            failure)
+              # The two messages that mean drift, matched literally. Not the
+              # bare "catalog" substring: the same run can fail because the
+              # catalog could not be read at all, which is a harness problem
+              # and is what the else branch exists to separate out.
+              if grep -qF -e 'catalog cases without a conformance_case! marker' \
+                          -e 'conformance_case! markers with no matching catalog case' \
+                          "$RUNNER_TEMP/alignment.log"; then
+                echo "::warning::Conformance-catalog drift: the alignment check fails against the latest catalog. Cases have been added, renamed or dropped since the pinned ref ($pinned). Review github.com/AuthPlane/conformance, add or correct SDK-side coverage, then bump .conformance-catalog-ref."
+                {
+                  echo "### Conformance catalog: drift detected"
+                  echo ""
+                  echo "The alignment check fails against the **latest** catalog (default branch)."
+                  echo "Cases have been added, renamed or dropped since the pinned ref \`$pinned\`."
+                  echo ""
+                  echo "**Next steps:**"
+                  echo "1. Read the alignment failure in the job log above for the offending case ids."
+                  echo "2. Add or correct the \`conformance_case!\` coverage under \`conformance-tests/tests/\`."
+                  echo "3. Bump \`.conformance-catalog-ref\` to the new catalog SHA in the same change."
+                } >> "$GITHUB_STEP_SUMMARY"
+              else
+                echo "::warning::The alignment step failed without a drift message. This is a build or harness problem — a compile error, a failed crate download, or an unreadable catalog clone — not catalog drift. Read the step log before touching .conformance-catalog-ref."
+                {
+                  echo "### Conformance catalog: check failed for another reason"
+                  echo ""
+                  echo "The alignment step failed, but its log carries neither drift message."
+                  echo "That points at a build or harness problem (compile error, crate download, unreadable catalog), **not** catalog drift."
+                  echo ""
+                  echo "Read the step log above before touching \`.conformance-catalog-ref\`."
+                } >> "$GITHUB_STEP_SUMMARY"
+              fi
+              ;;
+            *)
+              echo "::warning::The alignment check did not run (outcome: ${{ steps.align.outcome }}). An earlier step failed — most likely the catalog clone, the catalog-file guard, or the toolchain install. This is a harness problem, not catalog drift."
+              {
+                echo "### Conformance catalog: check did not run"
+                echo ""
+                echo "The alignment step was \`${{ steps.align.outcome }}\`, so drift was never evaluated."
+                echo "Read the first failing step in the job — this says nothing about the catalog."
+              } >> "$GITHUB_STEP_SUMMARY"
+              ;;
+          esac

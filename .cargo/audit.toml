@@ -1,0 +1,14 @@
+# cargo-audit policy. When an advisory has no available fix, ignore it with an
+# explicit rationale + a pointer to the upstream issue. Reviewed periodically;
+# remove the ignore the moment an upgrade lands.
+
+[advisories]
+ignore = [
+    # RSA timing sidechannel (Marvin) — no fixed version available as of
+    # 2026-05. Tracking: https://github.com/RustCrypto/RSA/issues/19
+    # Impact: const-time mitigation for RSA private-key operations. The
+    # SDK only verifies RSA signatures with public keys (no private-key
+    # ops in the hot path), so the Marvin attack vector is not reachable
+    # through the public API surface.
+    "RUSTSEC-2023-0071",
+]

@@ -1,0 +1,31 @@
+[package]
+name = "authplane-fastmcp"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Authplane adapter helpers for fastmcp-rust (stdio + HTTP)."
+readme = "README.md"
+keywords = ["oauth", "jwt", "fastmcp", "adapter", "authplane"]
+categories = ["authentication", "api-bindings"]
+
+[dependencies]
+authplane-sdk = { path = "../core", version = "0.1.0" }
+fastmcp-rust = "0.3.0"
+serde_json = "1"
+tokio = { version = "1", features = ["sync", "macros", "rt"] }
+uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+fastmcp-core = "0.3.0"
+fastmcp-protocol = "0.3.0"
+fastmcp-server = "0.3.0"
+tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread"] }
+
+# Runnable demo lives in `demo/` (not `examples/`) alongside its `README.md`
+# and `run.sh`. Cargo's example auto-discovery is opt-in via this explicit
+# entry; `cargo run --example calculator_demo` still works.
+[[example]]
+name = "calculator_demo"
+path = "demo/calculator_demo.rs"

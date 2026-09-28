@@ -1,0 +1,17 @@
+# The single source of truth for the compiler this repo builds with — in CI and
+# on a contributor's machine alike. Every workflow that compiles this workspace
+# installs the toolchain named here instead of passing one of its own, so a
+# green local run and a green CI run mean the same thing.
+#
+# Pinned to an exact version rather than `stable`, which floats: with a floating
+# channel a Rust release turns every open PR red without anyone touching code,
+# and a contributor whose box is a few releases behind cannot reproduce it (a
+# clippy lint that gained coverage in a new release did exactly that here). An
+# exact pin makes a toolchain upgrade a reviewable commit: bump the channel and
+# absorb whatever the new rustc and clippy flag, in that one change.
+#
+# When bumping, stay at or above the cargo floor documented in release.yml and
+# publish-crates.yml (1.90), and above the MSRV declared in Cargo.toml (1.91).
+[toolchain]
+channel = "1.98.0"
+components = ["rustfmt", "clippy"]
